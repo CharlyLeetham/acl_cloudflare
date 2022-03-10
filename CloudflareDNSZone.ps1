@@ -1,6 +1,7 @@
 ﻿## Cloudflare Bulk domain importer and redirector script
 # V1.0 by Grahame Petch (20220202)
-# V1.1 By Charly Dwyer (20220302)
+# V1.1 by Charly Dwyer (20220302)
+# V1.2 by Charly Dwyer (20220310)
 
 
 
@@ -74,7 +75,7 @@ Function GetDZid{ #Called to find the ZoneID of the domain we're working with.
     [String] $zone)
 
   #Thanks to https://www.powershellgallery.com/packages/Posh-ACME/2.0/Content/DnsPlugins%5CCloudflare.ps1 for base code for this.
-  $zoneid=invoke-restmethod  -method get -uri $BaseURI"/?per_page=1000&order=type&direction=asc" -Headers $Headers #make the request
+  $zoneid=invoke-restmethod  -method get -uri "https://api.cloudflare.com/client/v4/zones/?per_page=1000&order=type&direction=asc" -Headers $Headers #make the request
   $allzones = $zoneid.result #Get all the zones in the results
   $totalzones = $zoneid.result_info.count #Get the total number of zones in the result
   $targetdomain = $zoneid.result | Where-Object {$_.name -eq "$zone"}  #Now the work begins. Select the domain we're looking for using the domainname.
@@ -87,7 +88,7 @@ Function GetDNSZones { #Find the Zones for an existing domain
     [Parameter(Mandatory=$True)]
     [String] $ZoneID)
 
-    $allrecords=invoke-restmethod  -method get -uri $BaseURI"/$($ZoneID)/dns_records?per_page=1000&order=type&direction=asc&match=all" -Headers $Headers
+    $allrecords=invoke-restmethod  -method get -uri "https://api.cloudflare.com/client/v4/zones/$($ZoneID)/dns_records?per_page=1000&order=type&direction=asc&match=all" -Headers $Headers
     return $allrecords
 }
 
@@ -101,13 +102,33 @@ Function ADDIPAddress {
         type = "A"
         name = "$NewDomain"
         content = "$IPAddress"
-        proxied = $true
+        proxied = $True
     }
 
     $JSONData = $Body | ConvertTo-Json
-    $JSONResult = invoke-restmethod  -method Post -uri $BaseURI"/$($ZoneID)/dns_records"  -ContentType "application/json"  -Headers $Headers -Body $jsondata
+    $JSONResult = invoke-restmethod  -method Post -uri "https://api.cloudflare.com/client/v4/zones/$($ZoneID)/dns_records"  -ContentType "application/json"  -Headers $Headers -Body $jsondata
     return $JSONResult.success
 }
+
+Function ADDCName {
+
+  Param(
+    [Parameter(Mandatory=$True)]
+    [String] $ZoneID)
+
+    $Body = @{
+        type = "CNAME"
+        name = "www.$NewDomain"
+        content = "$NewDomain"
+        proxied = $True
+    }
+
+    $JSONData = $Body | ConvertTo-Json
+    $JSONResult = invoke-restmethod  -method Post -uri "https://api.cloudflare.com/client/v4/zones/$($ZoneID)/dns_records"  -ContentType "application/json"  -Headers $Headers -Body $jsondata
+    return $JSONResult.success
+}
+
+
 
 
 Function ChangeProxy {
@@ -117,18 +138,31 @@ Function ChangeProxy {
     [String] $ZoneID,
 
     [Parameter(Mandatory=$True)]
-    [String] $DNSID
+    [String] $DNSID,
+
+    [Parameter(Mandatory=$True)]
+    [String] $rectype
+
     )
 
-    $Body = @{
-        type = "A"
-        name = "$NewDomain"
-        content = "$IPAddress"
-        proxied = $true
+    if ( $rectype -eq "A" ) {
+      $Body = @{
+          type = "A"
+          name = "$NewDomain"
+          content = "$IPAddress"
+          proxied = $true
+      }
+    } elseif ( $rectype -eq "CNAME" ) {
+      $Body = @{
+          type = "CNAME"
+          name = "www.$NewDomain"
+          content = "$NewDomain"
+          proxied = $true
+      }
     }
 
     $JSONData = $Body | ConvertTo-Json
-    $JSONResult = invoke-restmethod  -method PUT -uri $BaseURI"/$($ZoneID)/dns_records/$($DNSID)"  -ContentType "application/json"  -Headers $Headers -Body $JSONData
+    $JSONResult = invoke-restmethod  -method PUT -uri "https://api.cloudflare.com/client/v4/zones/$($ZoneID)/dns_records/$($DNSID)"  -ContentType "application/json"  -Headers $Headers -Body $JSONData
     return $JSONResult.success
 }
 
@@ -159,40 +193,142 @@ foreach ($Domain in $DomainList) {
       $ZoneID = ""
       echo $overview.errors.message`r
     }
-    if ($ZoneID -ne "") {
-      $allrecords = GetDNSZones($ZoneID)    #Have DNS records been added? No? Then add some.
-      if ( !$allrecords.result.id ) { #If there's no id in the results, there's not DNS records
-        echo "Domain: $NewDomain has no DNS records`r"
-        $addipaddress = ADDIPAddress($ZoneID)
-        echo $addipaddress`r
+
+    ## Check for DNS Zone and add records.
+    $allrecords = GetDNSZones($ZoneID)    #Have DNS records been added? No? Then add some.
+    if ( !$allrecords.result.id ) { #If there's no id in the results, there's not DNS records
+      echo "Domain: $NewDomain has no DNS records`r"
+      $addipaddress = ADDIPAddress($ZoneID)
+      echo $addipaddress`r
+      $addcname = ADDCName($ZoneID)
+      echo $addcname`r
+    } else { # There are zones already. Make sure there is a CNAME
+      echo "Domain: $NewDomain has DNS records. Checking for A record and CName`r"
+      echo $allrecords.result`r
+
+      $rec = $allrecords.result #The main array so we can work.
+      $ar = $allrecords.result #This gets filtered as we go through
+
+
+      ## Check if the A Record exists
+      switch ( ($ar.type -contains "A") -and ($ar.content -contains $IPAddress) -and ($ar.name -contains $NewDomain ) ) {
+        false {
+            ### The A record for the domain is missing. Or the IP address is wrong. ###
+            echo "Domain: $NewDomain has no A record. Adding ...`r"
+            $addipaddress = ADDIPAddress($ZoneID)
+            echo "Added: "$addipaddress`r
+        }
+
+        true {
+         break
+        }
       }
-      ## Call the function to add the permanent redirection rule to the newly created zone
-      $Result=AddRedirection -New_Domain $NewDomain -Zone_ID $ZoneID -ForwardingURL $RedirectURL
-      #echo $Result
+
+      ## Check if the CName entry exists
+      switch ( ($ar.type -contains "CNAME") -and ($ar.name -contains "www.$newDomain") ) {
+        true {
+          break
+        }
+
+        false {
+          echo "Domain: $NewDomain has no CNAME record. Adding...`r"
+          $addipaddress = ADDCName($ZoneID)
+          echo "Added: "$addipaddress`r
+        }
+      }
+
+      ## As a catchall, make sure proxy is turned on, just in case something went screwy
+      switch ( ( ($ar.type -contains "A") -and ($ar.content -contains $IPAddress) ) -or ( ($ar.type -contains "CNAME") -and ($ar.name -contains $NewDomain) ) ) {
+        ## Filtered for on A records that contain our IP address OR CNames that are on our main domain (not subdomains etc)
+        true {
+          foreach ( $a1 in $ar ) {
+            switch ( ( $a1.proxiable ) -and ( !$a1.proxied ) ) {
+              true {
+                $a1name = $a1.name
+                $a1type = $a1.type
+                echo "Changing Proxy for $a1name ($a1type)`n"
+                $DNSID = $a1.id
+                $cp = ChangeProxy $ZoneID $DNSID $a1type
+                echo $cp
+              }
+
+              false {
+                break
+              }
+            }
+          }
+
+        }
+
+        false { #No records need checking
+          break
+        }
+      }
     }
+
+    ## Call the function to add the permanent redirection rule to the newly created zone
+    $Result=AddRedirection -New_Domain $NewDomain -Zone_ID $ZoneID -ForwardingURL $RedirectURL
+    #echo $Result
 
   } else {
     echo "Domain: $NewDomain exists with ID $ZoneID`r"
     ## Here we can check if there's actuallly DNS records for the domain!!!
     $allrecords = GetDNSZones($ZoneID)
-    if ( !$allrecords.result.id ) { #If there's no id in the results, there's not DNS records
-      echo "Domain: $NewDomain has no DNS records. Adding.`r"
-      $addipaddress = ADDIPAddress($ZoneID)
-      echo $addipaddress`r
-    } else { #DNS Records exist. Check the A record.
-      #echo $allrecords.result`r
-      foreach ($rec in $allrecords.result) { #There's likely a neater way to do this. Cycle through each record in the returned DNS entries
-        if ( $rec.type -eq "A") { #Is the record type an 'A' record?  (this could become a variable for later)
-          if ($rec.name -eq $NewDomain) { #Is the A record for the domain itself?
-            $recontent = $rec.content
-            $recproxied = $rec.proxied
-            if (!$recproxied) {
-              echo "Changing Proxy`n"
-              $DNSID = $rec.id
-              ChangeProxy $Zoneid $DNSID
+    $rec = $allrecords.result #The main array so we can work.
+    $ar = $allrecords.result #This gets filtered as we go through
+
+    ## Check if the A Record exists
+    switch ( ($ar.type -contains "A") -and ($ar.content -contains $IPAddress) -and ($ar.name -contains $NewDomain ) ) {
+      false {
+          ### The A record for the domain is missing. Or the IP address is wrong. ###
+          echo "Domain: $NewDomain has no A record`r"
+          $addipaddress = ADDIPAddress($ZoneID)
+          echo $addipaddress`r
+      }
+
+      true {
+       break
+      }
+    }
+
+    ## Check if the CName entry exists
+    switch ( ($ar.type -contains "CNAME") -and ($ar.name -contains "www.$newDomain") ) {
+      true {
+        break
+      }
+
+      false {
+        echo "Domain: $NewDomain has no CNAME record`r"
+        $addipaddress = ADDCName($ZoneID)
+        echo $addipaddress`r
+      }
+    }
+
+    ## As a catchall, make sure proxy is turned on, just in case something went screwy
+    switch ( ( ($ar.type -contains "A") -and ($ar.content -contains $IPAddress) ) -or ( ($ar.type -contains "CNAME") -and ($ar.name -contains $NewDomain) ) ) {
+      ## Filtered for on A records that contain our IP address OR CNames that are on our main domain (not subdomains etc)
+      true {
+        foreach ( $a1 in $ar ) {
+          switch ( ( $a1.proxiable ) -and ( !$a1.proxied ) ) {
+            true {
+              $a1name = $a1.name
+              $a1type = $a1.type
+              echo "Changing Proxy for $a1name ($a1type)`n"
+              $DNSID = $a1.id
+              $cp = ChangeProxy $ZoneID $DNSID $a1type
+              echo $cp
+            }
+
+            false {
+              break
             }
           }
         }
+
+      }
+
+      false { #No records need checking
+        break
       }
     }
   }
